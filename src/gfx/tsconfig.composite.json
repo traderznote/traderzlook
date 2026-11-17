@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "rootDir": ".",
+    "outDir": "../../.tsbuild/gfx",
+    "tsBuildInfoFile": "../../.tsbuild/gfx.tsbuildinfo"
+  },
+  "files": ["../globals.d.ts"],
+  "include": ["**/*.ts"],
+  "exclude": ["**/*.test.ts", "**/*.spec.ts"],
+  "references": [
+    { "path": "../core/tsconfig.composite.json" }
+  ]
+}

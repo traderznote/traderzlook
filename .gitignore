@@ -1,0 +1,49 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build output
+dist/
+build/
+out/
+.tsbuild/
+*.tsbuildinfo
+
+# Test & coverage
+coverage/
+.nyc_output/
+test-results/
+playwright-report/
+playwright/.cache/
+.playwright-mcp/
+
+# Local preview / debug artifacts (browser-driven snapshots; not part of the library)
+/*.png
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Misc
+.cache/
+.understand-anything/
+graphify-out/
+
+# Design docs — kept local, not published
+dev-docs/

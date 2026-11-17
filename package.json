@@ -1,0 +1,61 @@
+{
+  "name": "traderzlook",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Traderzlook — a brand-new, Apache-2.0-licensed, open-source financial charting library — built from scratch in TypeScript.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "packageManager": "bun@1.4.4",
+  "workspaces": [
+    "bench"
+  ],
+  "trustedDependencies": [
+    "esbuild"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": "./dist/index.mjs",
+    "./gfx": "./dist/gfx.mjs",
+    "./extras": "./dist/extras.mjs",
+    "./extras/tool-host": "./dist/extras/tool-host.mjs",
+    "./extras/sync-group": "./dist/extras/sync-group.mjs",
+    "./extras/ema": "./dist/extras/ema.mjs",
+    "./extras/price-axis": "./dist/extras/price-axis.mjs",
+    "./extras/yield-curve": "./dist/extras/yield-curve.mjs"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "verify": "tsc -b tsconfig.verify.json && depcruise --config .dependency-cruiser.cjs src",
+    "loc": "node scripts/loc-budget.mjs",
+    "build": "node scripts/build.mjs",
+    "size": "bun run build && size-limit",
+    "profiling:free": "node scripts/profiling-free.mjs",
+    "test": "vitest run --passWithNoTests",
+    "bench": "node scripts/bench.mjs",
+    "conformance": "node scripts/conformance.mjs",
+    "demo:bootstrap": "node scripts/verify-bootstrap.mjs",
+    "demo:core": "node scripts/demo-core.mjs",
+    "demo:fmt": "node scripts/demo-fmt.mjs",
+    "demo:data": "node scripts/demo-data.mjs",
+    "demo:gfx": "node scripts/demo-gfx.mjs",
+    "demo:model": "node scripts/demo-model.mjs",
+    "demo:views": "node scripts/demo-views.mjs",
+    "demo:host": "node scripts/demo-host.mjs",
+    "demo:chart": "node scripts/demo-chart.mjs",
+    "demo:bench": "node --expose-gc scripts/demo-bench.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0",
+    "@size-limit/file": "^11.1.0",
+    "dependency-cruiser": "^16.0.0",
+    "esbuild": "^0.24.0",
+    "size-limit": "^11.1.0",
+    "tinybench": "^3.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}

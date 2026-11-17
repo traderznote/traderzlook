@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    name: ${{ matrix.task }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The six hard gates (roadmap §2). bench + conformance are no-ops until
+        # M10 / M6 but are present from M0 so the pipeline shape is fixed.
+        task: [verify, loc, size, test, bench, conformance]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: bun
+      - run: bun install --frozen-lockfile
+      - run: bun run ${{ matrix.task }}

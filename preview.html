@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Traderzlook — preview (Binance live)</title>
+  <style>
+    :root { color-scheme: light dark; }
+    /* full-viewport layout: the chart takes every pixel the toolbar doesn't */
+    html, body { height: 100%; }
+    body {
+      margin: 0; display: flex; flex-direction: column; overflow: hidden;
+      background: #fff; color: #191919;
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    #chart { flex: 1; min-height: 0; position: relative; overflow: hidden; }
+    /* bottom toolbar under the time axis */
+    #toolbar {
+      flex: none; box-sizing: border-box; display: flex; align-items: center; gap: 8px;
+      padding: 6px 10px; border-top: 1px solid #e0e3eb;
+      background: #fff; color: #5b6b7b; font-size: 13px; user-select: none;
+    }
+    #toolbar .group { display: flex; gap: 2px; align-items: center; }
+    #toolbar .sep { width: 1px; height: 16px; background: #e0e3eb; }
+    #toolbar button {
+      border: none; background: none; color: #5b6b7b; font: inherit; font-weight: 600;
+      padding: 3px 8px; border-radius: 4px; cursor: pointer;
+    }
+    #toolbar button:hover { background: #f0f3fa; color: #131722; }
+    #toolbar button.active { color: #2962ff; background: #f0f3fa; }
+    #toolbar .symbol { font-weight: 700; color: #131722; letter-spacing: .01em; }
+    #toolbar input.symbol {
+      width: 92px; border: 1px solid #e0e3eb; border-radius: 4px; padding: 2px 5px;
+      color: #131722; background: #fff; font: inherit; font-weight: 600; text-transform: uppercase;
+    }
+    #toolbar .price { font-variant-numeric: tabular-nums; color: #131722; font-weight: 600; }
+    #toolbar .chg { font-variant-numeric: tabular-nums; font-weight: 600; }
+    #toolbar .chg.up { color: #0a7d28; } #toolbar .chg.down { color: #c1271c; }
+    #toolbar .spacer { flex: 1; }
+    #toolbar select { border: 1px solid #e0e3eb; border-radius: 4px; padding: 2px 4px; color: #131722; background: #fff; font: inherit; }
+    #toolbar .clock { font-variant-numeric: tabular-nums; color: #131722; }
+    #status { margin: 0; font-size: 12px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .ok { color: #0a7d28; } .warn { color: #b26a00; } .err { color: #c1271c; white-space: pre-wrap; }
+    .live { color: #0a7d28; font-weight: 700; }
+    .stale { color: #b26a00; font-weight: 700; }
+  </style>
+</head>
+<body>
+  <div id="chart"></div>
+  <div id="toolbar">
+    <input class="symbol" id="symbol" value="BTCUSDT" spellcheck="false" title="Binance symbol — press Enter to load" />
+    <span class="price" id="price">—</span>
+    <span class="chg" id="chg"></span>
+    <span class="live" id="live">●</span>
+    <div class="sep"></div>
+    <div class="group" id="timeframes" title="Bar interval"></div>
+    <div class="sep"></div>
+    <div class="group" id="ranges" title="Visible window"></div>
+    <span id="status">Loading…</span>
+    <span class="spacer"></span>
+    <span class="clock" id="clock">--:--:--</span>
+    <select id="tz" title="Display timezone"></select>
+  </div>
+
+  <script type="module">
+    import { createChartWith, canvasBackend, timeBehavior, CandlestickSeries } from './dist/index.mjs';
+
+    const statusEl = document.getElementById('status');
+    const set = (cls, msg) => { statusEl.className = cls; statusEl.textContent = msg; };
+    const chartEl = document.getElementById('chart');
+
+    // --- Binance ---------------------------------------------------------------------
+    // Real market data. api.binance.com is tried first; data-api.binance.vision is the
+    // public market-data-only mirror and answers when the main host is unreachable.
+    const HOSTS = ['https://api.binance.com', 'https://data-api.binance.vision'];
+    let hostIndex = 0;
+    let symbol = 'BTCUSDT';
+
+    const MINUTE = 60, HOUR = 3600, DAY = 86400;
+
+    // label → Binance interval, seconds, poll cadence, history to pull
+    const TIMEFRAMES = [
+      { label: '1m', iv: '1m', sec: MINUTE, poll: 1000, bars: 2000 },
+      { label: '5m', iv: '5m', sec: 5 * MINUTE, poll: 1000, bars: 1000 },
+      { label: '15m', iv: '15m', sec: 15 * MINUTE, poll: 2000, bars: 1000 },
+      { label: '1h', iv: '1h', sec: HOUR, poll: 5000, bars: 1000 },
+      { label: '4h', iv: '4h', sec: 4 * HOUR, poll: 10000, bars: 1000 },
+      { label: '1D', iv: '1d', sec: DAY, poll: 15000, bars: 1000 },
+    ];
+    const RANGES = [
+      { label: '1D', sec: DAY }, { label: '5D', sec: 5 * DAY }, { label: '1M', sec: 30 * DAY }, { label: 'All', sec: null },
+    ];
+    const TZS = [
+      { label: 'UTC-8', off: -8 }, { label: 'UTC-5', off: -5 }, { label: 'UTC', off: 0 },
+      { label: 'UTC+1', off: 1 }, { label: 'UTC+2', off: 2 }, { label: 'UTC+5:30', off: 5.5 },
+      { label: 'UTC+8', off: 8 },
+    ];
+
+    let bars = [];
+    let chart = null, candles = null;
+    let tf = TIMEFRAMES[3];   // 1h
+    let range = RANGES[1];    // 5D visible
+    let tzOffsetSec = 3600;
+    let timer = null;         // the poll timer for the current timeframe
+    let generation = 0;       // invalidates in-flight work when the timeframe or symbol changes
+    let lastUpdate = 0;
+
+    async function fetchJson(path) {
+      let lastErr;
+      for (let attempt = 0; attempt < HOSTS.length; attempt++) {
+        const host = HOSTS[(hostIndex + attempt) % HOSTS.length];
+        try {
+          const res = await fetch(host + path, { cache: 'no-store' });
+          if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + (await res.text()).slice(0, 120));
+          return await res.json();
+        } catch (e) {
+          lastErr = e;
+        }
+      }
+      hostIndex = (hostIndex + 1) % HOSTS.length;
+      throw lastErr ?? new Error('Binance unreachable');
+    }
+
+    // A Binance kline: [ openTime, open, high, low, close, volume, closeTime, ... ]
+    const toBar = (row) => ({
+      time: Math.floor(row[0] / 1000),
+      open: Number(row[1]), high: Number(row[2]), low: Number(row[3]), close: Number(row[4]),
+    });
+
+    // Pull `count` bars, paging backwards (1000 per request is the API limit).
+    async function fetchKlines(interval, count) {
+      const pages = [];
+      let endTime = null;
+      let total = 0;
+      while (total < count) {
+        const limit = Math.min(1000, count - total);
+        const q = new URLSearchParams({ symbol, interval, limit: String(limit) });
+        if (endTime !== null) q.set('endTime', String(endTime));
+        const rows = await fetchJson('/api/v3/klines?' + q.toString());
+        if (!Array.isArray(rows) || rows.length === 0) break;
+        pages.push(rows.map(toBar));
+        total += rows.length;
+        endTime = rows[0][0] - 1;
+        if (rows.length < limit) break;
+      }
+      return pages.reverse().flat();
+    }
+
+    // The 24h ticker, for the change badge next to the price.
+    async function fetchTicker24h() {
+      const t = await fetchJson('/api/v3/ticker/24hr?symbol=' + encodeURIComponent(symbol));
+      return { last: Number(t.lastPrice), change: Number(t.priceChangePercent) };
+    }
+
+    function describe(extra) {
+      set('ok', extra ?? `${symbol} · ${tf.label} bars · ${bars.length} bars`);
+    }
+
+    function paintPrice(price, change) {
+      document.getElementById('price').textContent = price === undefined ? '—' :
+        price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const el = document.getElementById('chg');
+      if (change === undefined) { el.textContent = ''; return; }
+      el.textContent = (change >= 0 ? '+' : '') + change.toFixed(2) + '%';
+      el.className = 'chg ' + (change >= 0 ? 'up' : 'down');
+    }
+
+    // Show the last `sec` worth of bars of the current timeframe.
+    function applyRange(r) {
+      if (chart === null) return;
+      const ts = chart.timeScale();
+      if (r.sec === null) { ts.fitContent(); return; }
+      const count = Math.max(2, Math.ceil(r.sec / tf.sec));
+      const last = bars.length - 1;
+      ts.setVisibleLogicalRange({ from: Math.max(0, last - count), to: last });
+    }
+
+    // The behavior reads the offset live; switching timezone only refreshes the labels.
+    function build() {
+      const behavior = timeBehavior({ timezoneOffset: () => tzOffsetSec });
+      chart = createChartWith(chartEl, canvasBackend(), behavior, {
+        width: chartEl.clientWidth, height: chartEl.clientHeight,
+        layout: { textColor: '#191919', background: { color: '#ffffff' } },
+        timeScale: { timeVisible: true },
+      });
+      candles = chart.addSeries(CandlestickSeries, {
+        upColor: '#26a69a', downColor: '#ef5350',
+        borderUpColor: '#26a69a', borderDownColor: '#ef5350',
+        wickUpColor: '#26a69a', wickDownColor: '#ef5350',
+      });
+      window.__tn = { chart, candles, symbol, get bars() { return bars; } };
+    }
+
+    function markActive(groupId, label) {
+      const group = document.getElementById(groupId);
+      [...group.children].forEach((c) => c.classList.toggle('active', c.textContent === label));
+    }
+
+    // Load a timeframe: full history, then poll for the forming candle.
+    async function loadTimeframe(next) {
+      const mine = ++generation;
+      tf = next;
+      markActive('timeframes', next.label);
+      if (timer !== null) { clearInterval(timer); timer = null; }
+      set('warn', `Loading ${symbol} ${next.label} from Binance…`);
+      try {
+        const loaded = await fetchKlines(next.iv, next.bars);
+        if (mine !== generation) return;
+        bars = loaded;
+        candles.setData(bars);
+        applyRange(range);
+        const t = await fetchTicker24h().catch(() => undefined);
+        if (mine !== generation) return;
+        paintPrice(t?.last ?? bars[bars.length - 1]?.close, t?.change);
+        lastUpdate = Date.now();
+        describe();
+        poll(mine);
+      } catch (e) {
+        if (mine !== generation) return;
+        set('err', 'Binance error: ' + (e && e.message ? e.message : e));
+        timer = setInterval(() => { loadTimeframe(tf); }, 10000); // retry
+      }
+    }
+
+    // Poll the forming candle. Binance's last kline is the in-progress one.
+    function poll(mine) {
+      timer = setInterval(async () => {
+        if (mine !== generation) return;
+        try {
+          const rows = await fetchJson('/api/v3/klines?symbol=' + encodeURIComponent(symbol) +
+            '&interval=' + tf.iv + '&limit=2');
+          if (mine !== generation) return;
+          const bar = toBar(rows[rows.length - 1]);
+          const last = bars[bars.length - 1];
+          if (last !== undefined && bar.time === last.time) bars[bars.length - 1] = bar;
+          else if (last === undefined || bar.time > last.time) bars.push(bar);
+          else return; // an older bar; nothing to do
+          candles.update(bar);
+          paintPrice(bar.close);
+          lastUpdate = Date.now();
+          document.getElementById('live').className = 'live';
+          document.getElementById('live').textContent = '● live';
+          describe();
+        } catch (e) {
+          document.getElementById('live').className = 'stale';
+          document.getElementById('live').textContent = '● stale';
+          set('err', 'Binance error: ' + (e && e.message ? e.message : e));
+        }
+      }, tf.poll);
+    }
+
+    function buildToolbar() {
+      const tfs = document.getElementById('timeframes');
+      tfs.innerHTML = '';
+      for (const t of TIMEFRAMES) {
+        const b = document.createElement('button');
+        b.textContent = t.label;
+        b.onclick = () => loadTimeframe(t);
+        tfs.appendChild(b);
+      }
+      markActive('timeframes', tf.label);
+
+      const ranges = document.getElementById('ranges');
+      ranges.innerHTML = '';
+      for (const r of RANGES) {
+        const b = document.createElement('button');
+        b.textContent = r.label;
+        b.onclick = () => { range = r; applyRange(r); markActive('ranges', r.label); };
+        ranges.appendChild(b);
+      }
+      markActive('ranges', range.label);
+
+      const symbolInput = document.getElementById('symbol');
+      symbolInput.value = symbol;
+      symbolInput.onchange = () => {
+        const next = symbolInput.value.trim().toUpperCase();
+        if (next === '' || next === symbol) return;
+        symbol = next;
+        symbolInput.value = symbol;
+        window.__tn.symbol = symbol;
+        loadTimeframe(tf);
+      };
+
+      const tz = document.getElementById('tz');
+      tz.innerHTML = '';
+      for (const z of TZS) {
+        const o = document.createElement('option');
+        o.value = String(z.off); o.textContent = z.label;
+        if (z.off * 3600 === tzOffsetSec) o.selected = true;
+        tz.appendChild(o);
+      }
+      tz.onchange = () => {
+        tzOffsetSec = Math.round(parseFloat(tz.value) * 3600);
+        chart.applyOptions({ localization: {} });
+        tickClock();
+      };
+    }
+
+    // A live clock in the selected timezone (wall-clock = UTC now + offset).
+    function tickClock() {
+      const now = new Date();
+      const utcMs = now.getTime() + now.getTimezoneOffset() * 60000;
+      const t = new Date(utcMs + tzOffsetSec * 1000);
+      const hh = String(t.getHours()).padStart(2, '0');
+      const mm = String(t.getMinutes()).padStart(2, '0');
+      const ss = String(t.getSeconds()).padStart(2, '0');
+      const z = TZS.find((x) => Math.round(x.off * 3600) === tzOffsetSec);
+      document.getElementById('clock').textContent = `${hh}:${mm}:${ss}  ${z ? z.label : 'UTC'}`;
+    }
+
+    try {
+      // ?symbol=ETHUSDT&tf=15m opens straight onto that instrument and timeframe.
+      const params = new URLSearchParams(location.search);
+      const wanted = params.get('symbol');
+      if (wanted) symbol = wanted.toUpperCase();
+      const wantedTf = params.get('tf');
+      const found = TIMEFRAMES.find((t) => t.label.toLowerCase() === (wantedTf ?? '').toLowerCase());
+      if (found) tf = found;
+
+      buildToolbar();
+      build();
+      tickClock();
+      setInterval(tickClock, 1000);
+      // The chart follows its flex box, so it tracks the viewport on window resize.
+      new ResizeObserver(() => {
+        if (chart !== null) chart.resize(chartEl.clientWidth, chartEl.clientHeight);
+      }).observe(chartEl);
+      loadTimeframe(tf);
+    } catch (e) {
+      set('err', 'Traderzlook render error:\n' + (e && e.stack ? e.stack : e));
+      window.__tn = { error: String(e && e.stack || e) };
+    }
+  </script>
+</body>
+</html>

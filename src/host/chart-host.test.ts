@@ -1,0 +1,352 @@
+import { describe, expect, test, vi } from 'vitest';
+import {
+  ChartHost,
+  type ChartHostDeps,
+  type ChartHostHooks,
+  type ElementFactory,
+  type MeasuredAxes,
+  type PaneSurfaceConfigs,
+} from './chart-host';
+import { createRafScheduler, type RafEnv } from './frame-scheduler';
+import type { HostElement, SurfaceConfig } from './surface-host';
+import { PaneScene } from '../views';
+import { ChartModel, UpdateLevel, createMask } from '../model';
+import { timeBehavior } from '../data';
+import { Emitter } from '../core';
+import type { FrameInfo, FrameScope, LayerId, DisplayList, Snapshot, SnapshotTile, SurfaceSnapshot } from '../gfx';
+
+function fakeRaf(): RafEnv & { flush(now: number): void; pending(): number } {
+  let next = 1;
+  const cbs = new Map<number, (now: number) => void>();
+  return {
+    requestAnimationFrame(cb) {
+      const h = next++;
+      cbs.set(h, cb);
+      return h;
+    },
+    cancelAnimationFrame(h) {
+      cbs.delete(h);
+    },
+    flush(now) {
+      const batch = [...cbs.entries()];
+      cbs.clear();
+      for (const [, cb] of batch) cb(now);
+    },
+    pending() {
+      return cbs.size;
+    },
+  };
+}
+
+function fakeEl(): HostElement {
+  return {
+    style: { position: '', left: '', top: '', width: '', height: '' },
+    appendChild: vi.fn(),
+    removeChild: vi.fn(),
+    getBoundingClientRect: () => ({ left: 0, top: 0, width: 0, height: 0 }),
+  };
+}
+
+// Also records DOM listeners and pointer-capture calls so tests can dispatch synthetic events.
+function fakeDomEl(): HostElement & {
+  dispatch(type: string, e: unknown): void;
+  hasListener(type: string): boolean;
+  captured: number[];
+} {
+  const listeners = new Map<string, (e: never) => void>();
+  const captured: number[] = [];
+  return {
+    style: { position: '', left: '', top: '', width: '', height: '' },
+    appendChild: vi.fn(),
+    removeChild: vi.fn(),
+    getBoundingClientRect: () => ({ left: 0, top: 0, width: 0, height: 0 }),
+    addEventListener(type: string, listener: (e: never) => void) {
+      listeners.set(type, listener);
+    },
+    removeEventListener(type: string) {
+      listeners.delete(type);
+    },
+    setPointerCapture(id: number) {
+      captured.push(id);
+    },
+    releasePointerCapture() {},
+    dispatch(type: string, e: unknown) {
+      const l = listeners.get(type);
+      if (l !== undefined) (l as (e: unknown) => void)(e);
+    },
+    hasListener: (type: string) => listeners.has(type),
+    captured,
+  } as HostElement & { dispatch(type: string, e: unknown): void; hasListener(type: string): boolean; captured: number[] };
+}
+
+function fakeBackend() {
+  const log: string[] = [];
+  let nextId = 0;
+  const composeCalls: { tiles: SnapshotTile[] }[] = [];
+  const backend = {
+    createSurface() {
+      const id = nextId++;
+      let media = { width: 0, height: 0 };
+      return {
+        setMediaSize(s: { width: number; height: number }) {
+          media = { ...s };
+        },
+        beginFrame(scope: FrameScope): FrameInfo {
+          log.push(`s${id}:begin(${scope})`);
+          return { mediaSize: media, bitmapSize: media, hr: 1, vr: 1 };
+        },
+        renderLayer(layer: LayerId, _l: readonly DisplayList[]) {
+          log.push(`s${id}:render(${layer})`);
+        },
+        endFrame() {
+          log.push(`s${id}:end`);
+        },
+        resolutionChanged: new Emitter(),
+        snapshot: (): SurfaceSnapshot => ({ _tag: 'SurfaceSnapshot' }),
+        dispose() {
+          log.push(`s${id}:dispose`);
+        },
+      };
+    },
+    composeSnapshot(tiles: readonly SnapshotTile[]): Snapshot {
+      composeCalls.push({ tiles: [...tiles] });
+      return { _tag: 'Snapshot' };
+    },
+  };
+  return { backend, log, composeCalls };
+}
+
+function cfg(kind: SurfaceConfig['kind']): SurfaceConfig {
+  return { kind, scene: new PaneScene() };
+}
+
+function fakeHooks(panes: number, axes: { left: number; right: number }, taH: number): ChartHostHooks & { calls: Record<string, number> } {
+  const calls: Record<string, number> = {
+    syncWidgets: 0, applyRender: 0, applyHover: 0, clearHover: 0, pan: 0, zoom: 0, resetPane: 0, priceAxisDrag: 0, priceScroll: 0,
+  };
+  const paneConfigs: PaneSurfaceConfigs[] = [];
+  for (let i = 0; i < panes; i++) paneConfigs.push({ pane: cfg('pane'), leftAxis: cfg('price-axis'), rightAxis: cfg('price-axis') });
+  const measured: MeasuredAxes = {
+    axisWidths: { left: axes.left, right: axes.right },
+    timeAxisHeight: taH,
+    timeAxis: cfg('time-axis'),
+    leftStub: cfg('pane'),
+    rightStub: cfg('pane'),
+  };
+  return {
+    calls,
+    paneConfigs: () => paneConfigs,
+    measure: () => measured,
+    syncWidgets: () => { calls.syncWidgets++; },
+    applyRender: () => { calls.applyRender++; },
+    animationRearmLevel: () => UpdateLevel.None,
+    applyHover: () => { calls.applyHover++; return true; },
+    clearHover: () => { calls.clearHover++; return true; },
+    pan: () => { calls.pan++; },
+    zoom: () => { calls.zoom++; },
+    resetPane: () => { calls.resetPane++; },
+    priceAxisDrag: () => { calls.priceAxisDrag++; },
+    priceScroll: () => { calls.priceScroll++; },
+  };
+}
+
+function build(opts?: { panes?: number; left?: number; right?: number; taH?: number }) {
+  const raf = fakeRaf();
+  const scheduler = createRafScheduler(raf);
+  const { backend, log, composeCalls } = fakeBackend();
+  const hooks = fakeHooks(opts?.panes ?? 1, { left: opts?.left ?? 0, right: opts?.right ?? 50 }, opts?.taH ?? 28);
+  let now = 0;
+  const elements: ElementFactory = { root: fakeEl, surfaceMount: fakeEl, separator: fakeEl };
+  const model = new ChartModel({ behavior: timeBehavior(), invalidate: () => {} });
+  // Match the model pane count to the surface rows; the default pane covers row 0.
+  for (let i = 1; i < (opts?.panes ?? 1); i++) model.panes().addPane();
+  const deps: ChartHostDeps = {
+    model, backend, elements, scheduler, hooks,
+    clock: () => now,
+    getDpr: () => 1,
+    separatorColor: '#e0e3eb',
+  };
+  const host = new ChartHost(deps);
+  return { host, raf, log, composeCalls, hooks, setNow: (t: number) => { now = t; } };
+}
+
+describe('ChartHost — frame coalescing (architecture §4.4)', () => {
+  test('N invalidations within one turn arm exactly ONE frame', () => {
+    const { host, raf } = build();
+    host.invalidate(createMask({ level: UpdateLevel.Overlay }));
+    host.invalidate(createMask({ level: UpdateLevel.Render }));
+    host.invalidate(createMask({ level: UpdateLevel.Layout }));
+    expect(raf.pending()).toBe(1);
+  });
+});
+
+describe('ChartHost — backend call sequence per UpdateLevel (rendering-backend §6)', () => {
+  test('Render frame: each visible surface does begin(full) → render(base) → render(overlay) → end', () => {
+    const { host, raf, log } = build({ panes: 1, left: 0, right: 50, taH: 28 });
+    host.setSize({ width: 400, height: 300 }); // Layout flush builds rects (synchronous)
+    log.length = 0;
+    host.invalidate(createMask({ level: UpdateLevel.Render }));
+    raf.flush(1);
+    const begins = log.filter((l) => l.includes(':begin('));
+    expect(begins.every((b) => b.endsWith('(full)'))).toBe(true);
+    for (const line of log) expect(line).toMatch(/:(begin\((full|overlay)\)|render\((base|overlay)\)|end)$/);
+    const ends = log.filter((l) => l.endsWith(':end'));
+    expect(ends.length).toBe(begins.length);
+    expect(begins.length).toBeGreaterThan(0);
+  });
+
+  test('Overlay frame: each visible surface does begin(overlay) → render(overlay) → end ONLY', () => {
+    const { host, raf, log } = build({ panes: 1, left: 0, right: 50, taH: 28 });
+    host.setSize({ width: 400, height: 300 });
+    log.length = 0;
+    host.invalidate(createMask({ level: UpdateLevel.Overlay }));
+    raf.flush(1);
+    expect(log.some((l) => l.includes('render(base)'))).toBe(false);
+    expect(log.filter((l) => l.includes(':begin('))).toSatisfy((b: string[]) => b.every((x) => x.endsWith('(overlay)')));
+    expect(log.some((l) => l.includes('render(overlay)'))).toBe(true);
+  });
+});
+
+describe('ChartHost — synchronous resize repaint (study 05 §3.8 anti-jitter)', () => {
+  test('setSize paints INLINE (no pending rAF afterward) and runs the Layout sequence', () => {
+    const { host, raf, log, hooks } = build();
+    host.setSize({ width: 400, height: 300 });
+    expect(raf.pending()).toBe(0);
+    expect(hooks.calls.syncWidgets).toBe(1);
+    expect(log.some((l) => l.endsWith(':end'))).toBe(true);
+  });
+});
+
+describe('ChartHost — hover flow (host → views → model, architecture §5.5)', () => {
+  test('a buttonless pointer-move over a pane drives applyHover and raises an Overlay frame', () => {
+    const { host, raf, hooks } = build();
+    host.setSize({ width: 400, height: 300 });
+    raf.flush(1); // drain any pending frame from setup
+    host.pointerMove(0, 'pane', { pointerId: 1, clientX: 30, clientY: 40, buttons: 0, pointerType: 'mouse', ctrlKey: false, altKey: false, shiftKey: false, metaKey: false });
+    expect(hooks.calls.applyHover).toBe(1);
+    expect(raf.pending()).toBe(1);
+  });
+});
+
+describe('ChartHost — default behaviors are priority-0 router registrations (§9.1 / §13.5 rule 4)', () => {
+  test('a pane drag dispatches through the router into the pan port', () => {
+    const { host, hooks, raf } = build();
+    host.setSize({ width: 400, height: 300 });
+    const p = (x: number, y: number, buttons: number) => ({ pointerId: 1, clientX: x, clientY: y, buttons, pointerType: 'mouse' as const, ctrlKey: false, altKey: false, shiftKey: false, metaKey: false });
+    host.pointerDown(0, 'pane', p(10, 10, 1));
+    host.pointerMove(0, 'pane', p(40, 10, 1)); // past the 5px slop ⇒ drag start
+    host.pointerMove(0, 'pane', p(60, 10, 1));
+    expect(hooks.calls.clearHover).toBeGreaterThanOrEqual(1);
+    expect(hooks.calls.pan).toBeGreaterThanOrEqual(1);
+    void raf;
+  });
+
+  test('a double-tap on a pane resets that pane', () => {
+    const { host } = build();
+    host.setSize({ width: 400, height: 300 });
+    const router = host.input();
+    const reset = vi.fn(() => 'pass' as const);
+    // A priority-10 tool sees the gesture before the priority-0 default.
+    router.register({ kinds: ['double-tap'], surfaces: ['pane'], priority: 10, handler: reset });
+    const t = (x: number) => ({ pointerId: 1, clientX: x, clientY: 10, buttons: 1, pointerType: 'touch' as const, ctrlKey: false, altKey: false, shiftKey: false, metaKey: false });
+    const tu = (x: number) => ({ ...t(x), buttons: 0 });
+    host.pointerDown(0, 'pane', t(10));
+    host.pointerUp(0, 'pane', tu(10));
+    host.pointerDown(0, 'pane', t(12));
+    host.pointerUp(0, 'pane', tu(12));
+    expect(reset).toHaveBeenCalled();
+  });
+});
+
+describe('ChartHost — DOM Pointer-Events adapter feeds the gesture machine (architecture §7)', () => {
+  // Mounts support DOM listeners, so synthetic events flow through the real adapter.
+  function buildDom() {
+    const raf = fakeRaf();
+    const scheduler = createRafScheduler(raf);
+    const { backend } = fakeBackend();
+    const hooks = fakeHooks(1, { left: 0, right: 50 }, 28);
+    const mounts: ReturnType<typeof fakeDomEl>[] = [];
+    let now = 0;
+    const elements: ElementFactory = {
+      root: fakeEl,
+      surfaceMount: () => {
+        const m = fakeDomEl();
+        mounts.push(m);
+        return m;
+      },
+      separator: fakeEl,
+    };
+    const model = new ChartModel({ behavior: timeBehavior(), invalidate: () => {} });
+    const deps: ChartHostDeps = {
+      model, backend, elements, scheduler, hooks,
+      clock: () => now, getDpr: () => 1, separatorColor: '#e0e3eb',
+    };
+    const host = new ChartHost(deps);
+    // The first mount created is pane 0's (see #buildRow order).
+    return { host, hooks, mounts, paneMount: mounts[0]!, setNow: (t: number) => { now = t; } };
+  }
+
+  test('a synthetic pointerdown→move→up on the pane mount drives a pan through the router', () => {
+    const { host, hooks, paneMount } = buildDom();
+    host.setSize({ width: 400, height: 300 });
+    expect(paneMount.hasListener('pointerdown')).toBe(true);
+    const p = (x: number, buttons: number) => ({
+      pointerId: 3, clientX: x, clientY: 50, buttons, pointerType: 'mouse',
+      ctrlKey: false, altKey: false, shiftKey: false, metaKey: false,
+    });
+    paneMount.dispatch('pointerdown', p(10, 1));
+    expect(paneMount.captured).toContain(3);
+    paneMount.dispatch('pointermove', p(40, 1)); // past the 5px slop ⇒ drag start
+    paneMount.dispatch('pointermove', p(70, 1));
+    paneMount.dispatch('pointerup', { ...p(70, 0) });
+    expect(hooks.calls.clearHover).toBeGreaterThanOrEqual(1);
+    expect(hooks.calls.pan).toBeGreaterThanOrEqual(1);
+  });
+
+  test('a synthetic wheel on the pane mount drives a zoom through the router', () => {
+    const { host, hooks, paneMount } = buildDom();
+    host.setSize({ width: 400, height: 300 });
+    let prevented = false;
+    paneMount.dispatch('wheel', {
+      deltaMode: 0, deltaX: 0, deltaY: 120, clientX: 100, clientY: 60,
+      ctrlKey: false, preventDefault: () => { prevented = true; },
+    });
+    expect(prevented).toBe(true); // the page must not scroll under the chart
+    expect(hooks.calls.zoom).toBeGreaterThanOrEqual(1);
+  });
+
+  test('dispose detaches the DOM listeners', () => {
+    const { host, paneMount } = buildDom();
+    host.setSize({ width: 400, height: 300 });
+    expect(paneMount.hasListener('wheel')).toBe(true);
+    host.dispose();
+    expect(paneMount.hasListener('wheel')).toBe(false);
+  });
+});
+
+describe('ChartHost — screenshot (architecture §7)', () => {
+  test('takeScreenshot flushes then composes tiles (surfaces + separators)', () => {
+    const { host, composeCalls } = build({ panes: 2, left: 0, right: 50, taH: 28 });
+    host.setSize({ width: 400, height: 300 });
+    const snap = host.takeScreenshot();
+    expect(snap).toEqual({ _tag: 'Snapshot' });
+    expect(composeCalls).toHaveLength(1);
+    const tiles = composeCalls[0]!.tiles;
+    expect(tiles.some((t) => 'fill' in t)).toBe(true);
+    expect(tiles.some((t) => 'snapshot' in t)).toBe(true);
+  });
+});
+
+describe('ChartHost — dispose', () => {
+  test('dispose drops the pending mask (a later rAF tick paints nothing) and disposes every surface', () => {
+    const { host, raf, log } = build();
+    host.invalidate(createMask({ level: UpdateLevel.Render }));
+    expect(raf.pending()).toBe(1);
+    host.dispose();
+    expect(log.filter((l) => l.endsWith(':dispose')).length).toBeGreaterThan(0);
+    // The shared rAF tick may still fire, but the dropped mask paints nothing.
+    log.length = 0;
+    raf.flush(1);
+    expect(log.filter((l) => l.includes(':begin('))).toEqual([]);
+  });
+});

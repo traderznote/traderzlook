@@ -1,0 +1,73 @@
+'use strict';
+// Module layering rules, enforced by `bun run verify`.
+
+/** @type {Record<string, string[]>} allowed cross-module imports */
+const ALLOWED = {
+  core: [],
+  fmt: ['core'],
+  gfx: ['core'],
+  data: ['core', 'fmt'],
+  model: ['core', 'fmt', 'data'],
+  views: ['core', 'fmt', 'data', 'model', 'gfx'],
+  'backend-canvas': ['core', 'gfx'],
+  host: ['core', 'fmt', 'gfx', 'data', 'model', 'views'],
+  api: ['core', 'fmt', 'gfx', 'data', 'model', 'views', 'host', 'backend-canvas'],
+  extras: ['api', 'gfx', 'core', 'fmt'],
+};
+
+const MODULES = Object.keys(ALLOWED);
+const esc = (s) => s.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
+
+const layerRules = MODULES.map((m) => {
+  const permitted = new Set([m, ...ALLOWED[m]]);
+  const forbidden = MODULES.filter((x) => !permitted.has(x));
+  return {
+    name: `layer-${m}`,
+    comment: `${m} may import only [${ALLOWED[m].join(', ') || 'nothing'}] (architecture §3.1).`,
+    severity: 'error',
+    from: { path: `^src/${esc(m)}/` },
+    to: { path: `^src/(${forbidden.map(esc).join('|')})/` },
+  };
+});
+
+module.exports = {
+  forbidden: [
+    ...layerRules,
+    {
+      name: 'entry-only-api-extras',
+      comment: 'src/index.ts may import only api and extras (architecture §3.1).',
+      severity: 'error',
+      from: { path: '^src/index\\.ts$' },
+      to: { path: '^src/', pathNot: ['^src/(api|extras)/', '^src/index\\.ts$'] },
+    },
+    {
+      name: 'backend-canvas-only-in-create-chart',
+      comment:
+        'Only api/create-chart.ts (the sole default-backend injection site) may import backend-canvas; ' +
+        'every other api file must stay backend-agnostic (architecture §3.1 / §8).',
+      severity: 'error',
+      from: { path: '^src/api/(?!create-chart\\.ts$)' },
+      to: { path: '^src/backend-canvas/' },
+    },
+    {
+      name: 'no-deep-import',
+      comment: 'Import another module only through its index.ts, never a deep file (architecture §3.2).',
+      severity: 'error',
+      from: { path: '^src/([^/]+)/' },
+      to: { path: '^src/[^/]+/', pathNot: ['^src/$1/', 'index\\.ts$'] },
+    },
+    {
+      name: 'no-circular',
+      comment: 'No import cycles within or across modules (architecture §3.2).',
+      severity: 'error',
+      from: {},
+      to: { circular: true },
+    },
+  ],
+  options: {
+    doNotFollow: { path: 'node_modules' },
+    tsConfig: { fileName: 'tsconfig.base.json' },
+    tsPreCompilationDeps: true,
+    enhancedResolveOptions: { extensions: ['.ts', '.js', '.mjs', '.cjs', '.json'] },
+  },
+};
